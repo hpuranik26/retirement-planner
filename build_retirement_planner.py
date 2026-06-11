@@ -1,5 +1,6 @@
 """
 Retirement Withdrawal Planner
+==============================
 Usage:
   python3 build_retirement_planner.py [scenario.xlsx]
 
@@ -7,6 +8,23 @@ Usage:
   Edit amber cells in the Inputs tab, then run again to produce results.
   Subsequent runs → reads Inputs + Tax Law year, writes all output tabs.
   Tax Tables tab shows the exact law values used in this run.
+
+Key features:
+  - 3-phase withdrawal model: Go-Go / Slow-Go / No-Go with configurable
+    rates and years. Spending inflates each year within a phase.
+  - Phase transition taper: linear glide from Go-Go → Slow-Go over
+    transition_years to smooth the spending cliff. After the taper ends,
+    No-Go inflates from the taper endpoint (no re-anchor to portfolio × rate).
+  - Roth conversion: fills up to a configurable federal bracket ceiling each
+    year. Conversion taxes are paid from the conversion amount itself and do
+    not reduce after-tax spendable cash.
+  - Tax engine: federal MFJ brackets, Oregon state tax, SS taxability
+    (IRC §86), LTCG/NIIT on dividends and taxable principal, IRMAA surcharges.
+  - RMD enforcement per SECURE 2.0 (age 75 start).
+  - Tax law database (2025 & 2026) with automatic fallback to latest year.
+  - Output sheets: Inputs, Tax Tables, Assumptions, Annual Summary,
+    SS Scenarios, Roth Conversion Scenario Comparison, Monte Carlo (2,000 runs),
+    Insurance Detail, RMD Projections, Strategy Summary.
 """
 
 import sys, os, datetime
@@ -149,7 +167,7 @@ DEFAULTS = {
     'gogo_years':       0,      # Years in Go-Go phase  (0 = retire_years ÷ 3)
     'slowgo_years':     0,      # Years in Slow-Go phase (0 = retire_years ÷ 3)
     'nogo_years':       0,      # Years in No-Go phase  (0 = remainder)
-    'transition_years': 3,      # Years to taper spending between phases (0 = instant step)
+    'transition_years': 3,      # Years to taper spending at Go-Go→Slow-Go transition (0 = instant step-down)
     'conv_bracket':     0.24,
     'retire_year':      2027,
     'retire_years':     35,
@@ -191,7 +209,7 @@ INPUT_ROWS = [
     ("Slow-Go Years",                'slowgo_years',     'int',   "Years in Slow-Go phase (0 = retire_years ÷ 3)", "WITHDRAWAL STRATEGY"),
     ("No-Go Withdrawal Rate",        'nogo_rate',        'pct',   "Phase 3 (later years, mostly home/care)",     "WITHDRAWAL STRATEGY"),
     ("No-Go Years",                  'nogo_years',       'int',   "Years in No-Go phase (0 = remainder of retire_years)", "WITHDRAWAL STRATEGY"),
-    ("Phase Transition Years",       'transition_years', 'int',   "Years to taper spending at each phase change (0 = instant step-down)", "WITHDRAWAL STRATEGY"),
+    ("Phase Transition Years",       'transition_years', 'int',   "Years to glide spending from Go-Go down to Slow-Go level (0 = instant step-down). No-Go then inflates from taper endpoint.", "WITHDRAWAL STRATEGY"),
     ("Roth Conversion Bracket",      'conv_bracket',     'pct',   "Fill Trad→Roth up to this federal bracket",   "WITHDRAWAL STRATEGY"),
     ("Tax Law Year",                 'tax_law_year',     'int',   f"Base tax law year. Available: {sorted(TAX_LAW_DB.keys())}. Future years fall back to latest.", "WITHDRAWAL STRATEGY"),
     ("Spouse 1 SS at FRA ($/mo)",    'ss1_fra_mo',       'money', "Monthly benefit at Full Retirement Age (67)", "SOCIAL SECURITY"),
@@ -813,7 +831,6 @@ def run_simulation(p, tl, base_yr):
             'irmaa':irmaa, 'eff1':eff1, 'eff2':eff2,
             'after_tax_cash':after_tax_cash, 'ins':ins,
             'after_tax_net':after_tax_net, 'rmd':rmd,
-            'active_rate':  active_rate,
             'actual_wd_rate': gross_target / total_port if total_port > 0 else 0.0,
             'aca_hh_size': aca_household_size(yr, p) if not (s1_age>=65 and s2_age>=65) else 0,
             'aca_cliff':   aca_subsidy_cliff(yr, s1_age, s2_age, p, inf),
