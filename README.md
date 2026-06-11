@@ -14,7 +14,7 @@ A 35-year retirement income and tax projection tool that produces a fully format
 - Flags IRMAA surcharges only for Medicare-eligible spouses
 - Projects RMDs (SECURE 2.0: age 75 for born 1960+) and flags shortfalls
 
-## Output — 8 Excel sheets
+## Output — 11 Excel sheets
 
 | Sheet | Contents |
 |---|---|
@@ -23,9 +23,12 @@ A 35-year retirement income and tax projection tool that produces a fully format
 | **Assumptions** | All parameters used + 35-year summary totals |
 | **Annual Summary** | Full year-by-year table (36 columns across 7 groups) |
 | **SS Scenarios** | Lifetime SS comparison: Early / FRA / Delay Primary to 70 |
+| **Roth Conversion Scenario Comparison** | Net after-tax cash and Roth conversion amounts across No Conversion / 22% / 24% bracket scenarios |
+| **Monte Carlo** | 2,000 simulations (log-normal μ=7.5% σ=12%); P10/P25/P50/P75/P90 percentile paths + bad-sequence (−35% crash year 3) |
 | **Insurance Detail** | Per-spouse ACA and Medicare costs by year, children on plan |
 | **RMD Projections** | Required Minimum Distributions from age 75, QCD notes |
 | **Strategy Summary** | Plain-language playbook and quarterly checklist |
+| **Charts** | Combo chart: stacked bars (Portfolio Withdrawal / SS Income / Total Tax) with Net After-Tax Cash line overlay |
 
 ## Requirements
 
