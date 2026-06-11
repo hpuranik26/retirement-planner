@@ -141,7 +141,15 @@ DEFAULTS = {
     'trad_bal':         4_000_000,
     'taxable_bal':      2_800_000,
     'roth_bal':           500_000,
-    'withdraw_rate':    0.05,
+    'withdraw_rate':    0.06,   # Fallback if no 3-phase rates set
+    'after_tax_rate':   0.0,    # If > 0: each phase re-anchors after-tax cash = portfolio × phase_rate
+    'gogo_rate':        0.05,   # Go-Go phase gross withdrawal rate
+    'slowgo_rate':      0.04,   # Slow-Go phase gross withdrawal rate
+    'nogo_rate':        0.03,   # No-Go phase gross withdrawal rate
+    'gogo_years':       0,      # Years in Go-Go phase  (0 = retire_years ÷ 3)
+    'slowgo_years':     0,      # Years in Slow-Go phase (0 = retire_years ÷ 3)
+    'nogo_years':       0,      # Years in No-Go phase  (0 = remainder)
+    'transition_years': 3,      # Years to taper spending between phases (0 = instant step)
     'conv_bracket':     0.24,
     'retire_year':      2027,
     'retire_years':     35,
@@ -175,10 +183,16 @@ INPUT_ROWS = [
     ("Tax-Deferred Balance",         'trad_bal',         'money', "Traditional IRA / 401(k) — pre-tax",          "PORTFOLIO"),
     ("Taxable Brokerage Balance",    'taxable_bal',      'money', "Brokerage account — LTCG on gains",           "PORTFOLIO"),
     ("Tax-Free (Roth) Balance",      'roth_bal',         'money', "Roth IRA / Roth 401(k)",                      "PORTFOLIO"),
-    ("Gross Withdrawal Rate",        'withdraw_rate',    'pct',   "% of total portfolio withdrawn each year",    "WITHDRAWAL STRATEGY"),
-    ("Roth Conversion Bracket",      'conv_bracket',     'pct',   "Fill Trad→Roth up to this federal bracket",   "WITHDRAWAL STRATEGY"),
     ("Retirement Start Year",        'retire_year',      'int',   "First year of withdrawals",                   "WITHDRAWAL STRATEGY"),
     ("Retirement Length (years)",    'retire_years',     'int',   "Number of years to project",                  "WITHDRAWAL STRATEGY"),
+    ("Go-Go Withdrawal Rate",        'gogo_rate',        'pct',   "Phase 1 (active early retirement) — spending re-anchors at each phase start", "WITHDRAWAL STRATEGY"),
+    ("Go-Go Years",                  'gogo_years',       'int',   "Years in Go-Go phase (0 = retire_years ÷ 3)", "WITHDRAWAL STRATEGY"),
+    ("Slow-Go Withdrawal Rate",      'slowgo_rate',      'pct',   "Phase 2 (mid retirement, slower pace)",       "WITHDRAWAL STRATEGY"),
+    ("Slow-Go Years",                'slowgo_years',     'int',   "Years in Slow-Go phase (0 = retire_years ÷ 3)", "WITHDRAWAL STRATEGY"),
+    ("No-Go Withdrawal Rate",        'nogo_rate',        'pct',   "Phase 3 (later years, mostly home/care)",     "WITHDRAWAL STRATEGY"),
+    ("No-Go Years",                  'nogo_years',       'int',   "Years in No-Go phase (0 = remainder of retire_years)", "WITHDRAWAL STRATEGY"),
+    ("Phase Transition Years",       'transition_years', 'int',   "Years to taper spending at each phase change (0 = instant step-down)", "WITHDRAWAL STRATEGY"),
+    ("Roth Conversion Bracket",      'conv_bracket',     'pct',   "Fill Trad→Roth up to this federal bracket",   "WITHDRAWAL STRATEGY"),
     ("Tax Law Year",                 'tax_law_year',     'int',   f"Base tax law year. Available: {sorted(TAX_LAW_DB.keys())}. Future years fall back to latest.", "WITHDRAWAL STRATEGY"),
     ("Spouse 1 SS at FRA ($/mo)",    'ss1_fra_mo',       'money', "Monthly benefit at Full Retirement Age (67)", "SOCIAL SECURITY"),
     ("Spouse 2 SS at FRA ($/mo)",    'ss2_fra_mo',       'money', "Monthly benefit at Full Retirement Age (67)", "SOCIAL SECURITY"),
@@ -296,6 +310,13 @@ def create_inputs_sheet(wb, values=None):
 # ═══════════════════════════════════════════════════════════════════════════════
 # READ INPUTS FROM EXCEL
 # ═══════════════════════════════════════════════════════════════════════════════
+LABEL_ALIASES = {
+    # Maps old/alternate label text → canonical key, so old Inputs sheets still read correctly
+    "Gross Withdrawal Rate":        "withdraw_rate",
+    "Withdrawal Rate":              "withdraw_rate",
+    "Annual Withdrawal Rate":       "withdraw_rate",
+}
+
 def read_inputs(filepath):
     wb = openpyxl.load_workbook(filepath, data_only=True)
     if "Inputs" not in wb.sheetnames:
@@ -304,11 +325,23 @@ def read_inputs(filepath):
     label_to_row = {cell.value.strip(): cell.row
                     for row in ws.iter_rows() for cell in row
                     if cell.column == 1 and isinstance(cell.value, str)}
+
+    # Build a key→row lookup that handles both canonical and alias labels
+    key_to_row = {}
+    for label, row in label_to_row.items():
+        # canonical labels
+        for canon_label, key, *_ in INPUT_ROWS:
+            if label == canon_label:
+                key_to_row[key] = row
+        # alias labels
+        if label in LABEL_ALIASES:
+            key_to_row[LABEL_ALIASES[label]] = row
+
     inputs = {}
     for label, key, vtype, _, _ in INPUT_ROWS:
-        if label not in label_to_row:
+        if key not in key_to_row:
             inputs[key] = DEFAULTS[key]; continue
-        raw = ws.cell(label_to_row[label], 2).value
+        raw = ws.cell(key_to_row[key], 2).value
         if raw is None:
             inputs[key] = DEFAULTS[key]; continue
         if vtype == 'int':    inputs[key] = int(raw)
@@ -472,10 +505,15 @@ def irmaa_surcharge(magi, yr, s1_age, s2_age, tl, base_yr):
     persons = (1 if s1_age>=65 else 0) + (1 if s2_age>=65 else 0)
     if persons == 0: return 0.0
     f = (1.02) ** (yr - base_yr)
-    surcharge_pp = 0.0
+    # Find the first tier whose inflated threshold >= MAGI — that tier's surcharge applies.
+    # Table is ordered: (upper_bound_of_tier, surcharge_for_tier).
+    # e.g. (218K, 0) means MAGI ≤ 218K → $0; (274K, 1147.92) means 218K < MAGI ≤ 274K → $1,147.92
+    surcharge_pp = tl['irmaa'][-1][1]   # default: top tier
     for thresh, annual_pp in tl['irmaa']:
-        if magi > thresh * f: surcharge_pp = annual_pp * f
-    return surcharge_pp * persons
+        if magi <= thresh * f:
+            surcharge_pp = annual_pp
+            break
+    return surcharge_pp * f * persons
 
 def aca_age_factor(age):
     ages = sorted(ACA_AGE_FACTORS.keys())
@@ -521,6 +559,57 @@ def rmd_amount(trad_prev, owner_age, tl):
     if owner_age < rmd_age: return 0.0
     return trad_prev / RMD_FACTORS.get(min(owner_age, 98), 7.3)
 
+def get_phase_info(i, p):
+    """Return (phase_name, phase_rate, is_phase_start) for simulation year index i."""
+    gogo_yrs   = p.get('gogo_years',   0) or p['retire_years'] // 3
+    slowgo_yrs = p.get('slowgo_years', 0) or p['retire_years'] // 3
+    # nogo gets the remainder
+    gogo_rate   = p.get('gogo_rate',   0) or p.get('withdraw_rate', 0.05)
+    slowgo_rate = p.get('slowgo_rate', 0) or p.get('withdraw_rate', 0.04)
+    nogo_rate   = p.get('nogo_rate',   0) or p.get('withdraw_rate', 0.03)
+
+    if i < gogo_yrs:
+        return 'Go-Go',   gogo_rate,   (i == 0)
+    elif i < gogo_yrs + slowgo_yrs:
+        return 'Slow-Go', slowgo_rate, (i == gogo_yrs)
+    else:
+        return 'No-Go',   nogo_rate,   (i == gogo_yrs + slowgo_yrs)
+
+
+def _trial_after_tax_cash(gross_target_trial, ann_div, ss_total, s1_age, s2_age, yr,
+                           trad_bal, roth_bal, taxable_bal, p, tl, base_yr, inf):
+    """Compute after_tax_cash for a trial gross_target — used by binary search."""
+    ss_tax_est = ss_total * 0.85
+    cap_ord    = bracket_ceiling(yr, s1_age, s2_age, p['conv_bracket'], tl, base_yr, inf)
+    max_trad   = min(max(0.0, cap_ord - ss_tax_est), trad_bal)
+    trad_needed = max(0.0, gross_target_trial - ann_div)
+    trad_wd    = min(trad_needed, max_trad)
+    remaining  = max(0.0, trad_needed - trad_wd)
+    taxable_principal_wd = min(remaining, max(0.0, taxable_bal))
+    roth_wd    = min(max(0.0, remaining - taxable_principal_wd), roth_bal)
+    ss_tax_amt = ss_taxable_amount(ss_total, trad_wd + ann_div)
+    sd         = std_ded(yr, s1_age, s2_age, tl, base_yr, inf)
+    used_taxable = max(0.0, trad_wd + ss_tax_amt - sd)
+    if p['conv_bracket'] > 0:
+        conv_top  = conv_bracket_taxable_top(yr, p['conv_bracket'], tl, base_yr, inf)
+        roth_conv = min(max(0.0, conv_top - used_taxable), max(0.0, trad_bal - trad_wd))
+    else:
+        roth_conv = 0.0
+    ordinary_gross = trad_wd + roth_conv + ss_tax_amt
+    f_tax_ord  = fed_tax_ordinary(ordinary_gross, yr, s1_age, s2_age, tl, base_yr, inf)
+    or_tax_ord = or_tax_ordinary(ordinary_gross, yr, tl, base_yr, inf)
+    magi       = trad_wd + roth_conv + ss_tax_amt + ann_div + taxable_principal_wd
+    div_fed, div_or, div_niit = div_taxes(ann_div, magi, yr, tl, base_yr, inf)
+    tx_fed, tx_or, tx_niit   = taxable_principal_taxes(taxable_principal_wd, magi, yr, tl, base_yr, inf)
+    # Conversion taxes paid from conversion — only spending taxes reduce cash
+    f_tax_spend  = fed_tax_ordinary(trad_wd + ss_tax_amt, yr, s1_age, s2_age, tl, base_yr, inf)
+    or_tax_spend = or_tax_ordinary(trad_wd + ss_tax_amt, yr, tl, base_yr, inf)
+    trad_net              = trad_wd - f_tax_spend - or_tax_spend
+    div_net               = ann_div - (div_fed + div_or + div_niit)
+    taxable_principal_net = taxable_principal_wd - (tx_fed + tx_or + tx_niit)
+    return trad_net + roth_wd + div_net + taxable_principal_net + ss_total
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # CORE SIMULATION
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -531,6 +620,14 @@ def run_simulation(p, tl, base_yr):
     taxable_bal = p['taxable_bal']
     trad_bal_prev = p['trad_bal']
     inf = p['inflation']
+    prev_gross_target = None
+    prev_atc_target   = None
+    prev_phase_rate   = None
+    transition_remaining  = 0     # years left in current taper
+    transition_total_yrs  = 0     # total length of current taper (for interpolation)
+    transition_start_gross  = None  # gross at start of taper
+    transition_target_gross = None  # gross at end of taper
+    post_taper = False            # True after a taper completes — phase boundaries inflate, no re-anchor
 
     for i in range(p['retire_years']):
         yr     = p['retire_year'] + i
@@ -541,7 +638,94 @@ def run_simulation(p, tl, base_yr):
         ann_div    = taxable_bal * p['div_yield']
         rmd        = rmd_amount(trad_bal_prev, s1_age, tl)
         total_port = trad_bal + roth_bal + taxable_bal
-        gross_target = total_port * p['withdraw_rate']
+        # Year 1: gross target from portfolio × withdrawal rate (or binary-search to hit
+        #         an after-tax cash target if after_tax_rate is set).
+        # Years 2+: inflate prior year's gross target (inflation-adjusted spending).
+        phase_name, phase_rate, is_phase_start = get_phase_info(i, p)
+        after_tax_rate = p.get('after_tax_rate', 0.0)
+
+        trans_yrs = p.get('transition_years', 0)
+
+        if after_tax_rate > 0:
+            # Binary search every year.
+            # Year 1: ATC target = portfolio × phase_rate.
+            # Phase transition (i > 0): scale prior ATC target by rate ratio for smooth drop.
+            # Within phase: inflate from prior year.
+            if i == 0:
+                atc_target = total_port * phase_rate
+            elif is_phase_start:
+                atc_target = prev_atc_target * (phase_rate / prev_phase_rate)
+            else:
+                atc_target = prev_atc_target * (1 + inf)
+            lo, hi = 0.0, total_port
+            for _ in range(25):
+                mid = (lo + hi) / 2
+                atc = _trial_after_tax_cash(mid, ann_div, ss_total, s1_age, s2_age, yr,
+                                            trad_bal, roth_bal, taxable_bal, p, tl, base_yr, inf)
+                if atc < atc_target: lo = mid
+                else:                hi = mid
+            gross_target = (lo + hi) / 2
+            active_rate = phase_rate
+
+        elif i == 0:
+            # First year: anchor to portfolio × rate
+            gross_target = total_port * phase_rate
+            active_rate  = phase_rate
+            transition_remaining  = 0
+            transition_total_yrs  = 0
+
+        elif transition_remaining > 0:
+            # Mid-taper: continue gliding — takes priority over phase boundaries
+            # so Slow-Go→No-Go doesn't restart a second taper mid-glide.
+            t = transition_total_yrs - transition_remaining + 1
+            gross_target = transition_start_gross + (transition_target_gross - transition_start_gross) * t / transition_total_yrs
+            active_rate  = phase_rate
+            transition_remaining -= 1
+            if transition_remaining == 0:
+                post_taper = True  # taper just finished; subsequent phases inflate, no re-anchor
+
+        elif is_phase_start and trans_yrs > 0 and phase_name == 'Slow-Go':
+            # Taper only fires at Go-Go → Slow-Go transition.
+            # Slow-Go → No-Go re-anchors normally (handled by the elif below).
+            # If trans_yrs covers the full Slow-Go + No-Go span (i.e. user wants one
+            # continuous glide), use the No-Go rate as the terminal target so spending
+            # lands at the correct long-run level at the end of retirement.
+            gogo_yrs_p   = p.get('gogo_years',   0) or p['retire_years'] // 3
+            slowgo_yrs_p = p.get('slowgo_years',  0) or p['retire_years'] // 3
+            nogo_yrs_p   = p['retire_years'] - gogo_yrs_p - slowgo_yrs_p
+            nogo_rate_p  = p.get('nogo_rate', 0) or p.get('withdraw_rate', 0.03)
+
+            if phase_name == 'Slow-Go' and trans_yrs >= slowgo_yrs_p + nogo_yrs_p:
+                # Extended taper: user explicitly set taper to cover ALL remaining years —
+                # glide all the way to No-Go level in one continuous glide.
+                terminal_rate        = nogo_rate_p
+                transition_total_yrs = slowgo_yrs_p + nogo_yrs_p
+            else:
+                terminal_rate        = phase_rate
+                transition_total_yrs = trans_yrs
+
+            proportional  = prev_gross_target * (terminal_rate / prev_phase_rate)
+            portfolio_cap = total_port * terminal_rate
+            transition_target_gross = min(proportional, portfolio_cap)
+            transition_start_gross  = prev_gross_target
+            transition_remaining    = transition_total_yrs
+            t = 1
+            gross_target = transition_start_gross + (transition_target_gross - transition_start_gross) * t / transition_total_yrs
+            active_rate  = phase_rate
+            transition_remaining -= 1
+
+        elif is_phase_start and not post_taper:
+            # Instant step-down (trans_yrs == 0, or no taper active)
+            proportional  = prev_gross_target * (phase_rate / prev_phase_rate)
+            portfolio_cap = total_port * phase_rate
+            gross_target  = min(proportional, portfolio_cap)
+            active_rate   = phase_rate
+            transition_remaining = 0
+
+        else:
+            # Within a phase, or post-taper phase boundary: inflate from prior year
+            gross_target = prev_gross_target * (1 + inf)
+            active_rate  = phase_rate
 
         # Step 1: Trad (up to conv_bracket ceiling)
         ss_tax_est = ss_total * 0.85
@@ -558,13 +742,16 @@ def run_simulation(p, tl, base_yr):
         # Step 3: Roth
         roth_wd    = min(max(0.0, remaining - taxable_principal_wd), roth_bal)
 
-        # Roth conversion: fill conv_bracket headroom
+        # Roth conversion: fill conv_bracket headroom (skip if conv_bracket=0)
         ss_tax_amt  = ss_taxable_amount(ss_total, trad_wd + ann_div)
         ordinary_wd = trad_wd + ss_tax_amt
         sd          = std_ded(yr, s1_age, s2_age, tl, base_yr, inf)
         used_taxable = max(0.0, ordinary_wd - sd)
-        conv_top    = conv_bracket_taxable_top(yr, p['conv_bracket'], tl, base_yr, inf)
-        roth_conv   = min(max(0.0, conv_top - used_taxable), max(0.0, trad_bal - trad_wd))
+        if p['conv_bracket'] > 0:
+            conv_top  = conv_bracket_taxable_top(yr, p['conv_bracket'], tl, base_yr, inf)
+            roth_conv = min(max(0.0, conv_top - used_taxable), max(0.0, trad_bal - trad_wd))
+        else:
+            roth_conv = 0.0
 
         # Taxes
         ordinary_gross = trad_wd + roth_conv + ss_tax_amt
@@ -577,13 +764,21 @@ def run_simulation(p, tl, base_yr):
         tx_tax_total  = tx_fed  + tx_or  + tx_niit
         total_tax     = f_tax_ord + or_tax_ord + div_tax_total + tx_tax_total
 
-        trad_net              = trad_wd - f_tax_ord - or_tax_ord
+        # Split ordinary taxes: spending portion (trad_wd + SS) vs conversion portion.
+        # Conversion taxes are paid from the conversion amount itself — they do NOT
+        # reduce after-tax spendable cash; instead they reduce the net amount going into Roth.
+        f_tax_spend  = fed_tax_ordinary(trad_wd + ss_tax_amt, yr, s1_age, s2_age, tl, base_yr, inf)
+        or_tax_spend = or_tax_ordinary(trad_wd + ss_tax_amt, yr, tl, base_yr, inf)
+        conv_tax     = (f_tax_ord + or_tax_ord) - (f_tax_spend + or_tax_spend)
+
+        trad_net              = trad_wd - f_tax_spend - or_tax_spend   # only spending taxes here
         div_net               = ann_div - div_tax_total
         taxable_principal_net = taxable_principal_wd - tx_tax_total
         after_tax_cash        = trad_net + roth_wd + div_net + taxable_principal_net + ss_total
-        ins           = insurance_cost(yr, s1_age, s2_age, p)
-        after_tax_net = after_tax_cash - ins
+        ins_base      = insurance_cost(yr, s1_age, s2_age, p)
         irmaa         = irmaa_surcharge(magi, yr, s1_age, s2_age, tl, base_yr)
+        ins           = ins_base + irmaa          # total insurance incl. IRMAA surcharge
+        after_tax_net = after_tax_cash - ins
         fed_taxable_income = max(0.0, ordinary_gross - sd)
         ss_pct_taxed = (ss_tax_amt / ss_total) if ss_total > 0 else 0.0
         total_cash_in = trad_wd + roth_wd + ann_div + taxable_principal_wd + ss_total
@@ -594,16 +789,21 @@ def run_simulation(p, tl, base_yr):
         # eff2: ALL taxes ÷ ALL cash received (lifestyle rate)
         eff2 = total_tax / total_cash_in if total_cash_in > 0 else 0.0
 
+        end_trad    = max(0.0, trad_bal - trad_wd - roth_conv) * (1 + p['growth_rate'])
+        end_roth    = max(0.0, roth_bal - roth_wd + roth_conv - conv_tax) * (1 + p['growth_rate'])
+        end_taxable = max(0.0, taxable_bal - taxable_principal_wd) * (1 + p['price_return'])
+        end_port    = end_trad + end_roth + end_taxable
+
         rows.append({
-            'year':yr, 's1_age':s1_age, 's2_age':s2_age,
+            'year':yr, 's1_age':s1_age, 's2_age':s2_age, 'phase':phase_name,
             'trad_open':trad_bal, 'roth_open':roth_bal, 'taxable_open':taxable_bal,
-            'total_port':total_port, 'gross_target':gross_target,
+            'total_port':total_port, 'end_port':end_port, 'gross_target':gross_target,
             'trad_wd':trad_wd, 'taxable_principal_wd':taxable_principal_wd,
             'roth_wd':roth_wd, 'div':ann_div, 'roth_conv':roth_conv,
             'ss1':ss1, 'ss2':ss2, 'ss_total':ss_total, 'ss_tax_amt':ss_tax_amt,
             'ordinary_gross':ordinary_gross, 'magi':magi,
             'fed_taxable_income':fed_taxable_income, 'ss_pct_taxed':ss_pct_taxed,
-            'f_tax_ord':f_tax_ord, 'or_tax_ord':or_tax_ord,
+            'f_tax_ord':f_tax_ord, 'or_tax_ord':or_tax_ord, 'conv_tax':conv_tax,
             'div_fed':div_fed, 'div_or':div_or, 'div_niit':div_niit,
             'div_tax_total':div_tax_total,
             'tx_fed':tx_fed, 'tx_or':tx_or, 'tx_niit':tx_niit,
@@ -613,13 +813,18 @@ def run_simulation(p, tl, base_yr):
             'irmaa':irmaa, 'eff1':eff1, 'eff2':eff2,
             'after_tax_cash':after_tax_cash, 'ins':ins,
             'after_tax_net':after_tax_net, 'rmd':rmd,
+            'active_rate':  active_rate,
+            'actual_wd_rate': gross_target / total_port if total_port > 0 else 0.0,
             'aca_hh_size': aca_household_size(yr, p) if not (s1_age>=65 and s2_age>=65) else 0,
             'aca_cliff':   aca_subsidy_cliff(yr, s1_age, s2_age, p, inf),
         })
 
+        prev_gross_target = gross_target
+        prev_atc_target   = atc_target if after_tax_rate > 0 else None
+        prev_phase_rate   = phase_rate
         trad_bal_prev = trad_bal
         trad_bal    = max(0.0, trad_bal - trad_wd - roth_conv) * (1 + p['growth_rate'])
-        roth_bal    = max(0.0, roth_bal - roth_wd  + roth_conv) * (1 + p['growth_rate'])
+        roth_bal    = max(0.0, roth_bal - roth_wd  + roth_conv - conv_tax) * (1 + p['growth_rate'])
         taxable_bal = max(0.0, taxable_bal - taxable_principal_wd) * (1 + p['price_return'])
 
     return rows
@@ -839,7 +1044,9 @@ def write_assumptions_output(wb, rows, p, tl, base_yr, actual_yr, fallback_used)
     fallback_note = f" (⚠ requested {p['tax_law_year']}, using {actual_yr} — not yet in database)" if fallback_used else ""
     ws.cell(1, 1, "ASSUMPTIONS USED IN THIS RUN").font = Font(bold=True, size=13, color=BLUE_H)
     ws.merge_cells("A1:C1")
-    ws.cell(2, 1, f"Generated: {datetime.date.today()} | Withdrawal: {p['withdraw_rate']*100:.0f}% | Conv Bracket: {p['conv_bracket']*100:.0f}% | Tax Law: {actual_yr}{fallback_note}")
+    rate_desc = f"Go-Go {p.get('gogo_rate',0)*100:.0f}% / Slow-Go {p.get('slowgo_rate',0)*100:.0f}% / No-Go {p.get('nogo_rate',0)*100:.0f}%" \
+                if p.get('gogo_rate', 0) > 0 else f"{p.get('withdraw_rate',0)*100:.0f}%"
+    ws.cell(2, 1, f"Generated: {datetime.date.today()} | Withdrawal: {rate_desc} | Conv Bracket: {p['conv_bracket']*100:.0f}% | Tax Law: {actual_yr}{fallback_note}")
     ws.cell(2, 1).font = Font(italic=True, size=9, color="888888" if not fallback_used else RED_H)
     ws.merge_cells("A2:C2")
 
@@ -887,9 +1094,9 @@ def write_assumptions_output(wb, rows, p, tl, base_yr, actual_yr, fallback_used)
 
     r += 1; r = section(r, "END BALANCES", GREY_H)
     last = rows[-1]
-    for label, val in [("Tax-Deferred", last['trad_open']*(1+p['growth_rate'])),
-                        ("Roth",          last['roth_open']*(1+p['growth_rate'])),
-                        ("Taxable",       last['taxable_open']*(1+p['price_return']))]:
+    for label, val in [("Tax-Deferred", max(0.0, last['trad_open'] - last['trad_wd'] - last['roth_conv']) * (1+p['growth_rate'])),
+                        ("Roth",          max(0.0, last['roth_open'] - last['roth_wd'] + last['roth_conv'] - last['conv_tax']) * (1+p['growth_rate'])),
+                        ("Taxable",       max(0.0, last['taxable_open'] - last['taxable_principal_wd']) * (1+p['price_return']))]:
         cv = row_out(r, label, val); cv.number_format = '#,##0'; r += 1
 
     ws.column_dimensions['A'].width = 36
@@ -908,9 +1115,12 @@ def write_annual_summary(wb, rows, p, actual_yr, fallback_used):
         ("Year",               'year',                'int',  "YEAR",             6),
         ("S1\nAge",            's1_age',               'int',  "YEAR",             6),
         ("S2\nAge",            's2_age',               'int',  "YEAR",             6),
+        ("Phase",              'phase',                'str',  "YEAR",             9),
+        ("Actual\nW/D Rate",    'actual_wd_rate',        'pct',  "YEAR",             8),
         ("Trad IRA\nBalance",  'trad_open',            '$',    "YEAR-END BALANCES",14),
         ("Roth\nBalance",      'roth_open',            '$',    "YEAR-END BALANCES",13),
         ("Taxable\nBalance",   'taxable_open',         '$',    "YEAR-END BALANCES",14),
+        ("Ending\nPortfolio\nBalance", 'end_port',     '$',    "YEAR-END BALANCES",16),
         ("Trad\nWithdrawal",   'trad_wd',              '$',    "WITHDRAWALS",      13),
         ("Taxable\nPrincipal", 'taxable_principal_wd', '$',    "WITHDRAWALS",      12),
         ("Roth\nWithdrawal",   'roth_wd',              '$',    "WITHDRAWALS",      12),
@@ -918,7 +1128,7 @@ def write_annual_summary(wb, rows, p, actual_yr, fallback_used):
         ("Roth\nConversion",   'roth_conv',            '$',    "WITHDRAWALS",      12),
         ("SS\nSpouse 1",       'ss1',                  '$',    "WITHDRAWALS",      11),
         ("SS\nSpouse 2",       'ss2',                  '$',    "WITHDRAWALS",      11),
-        ("Gross\nTotal",       'gross_target',         '$',    "WITHDRAWALS",      12),
+        ("Total Portfolio\nWithdrawal", 'gross_target', '$',    "WITHDRAWALS",      14),
         ("Hi Fed\nBracket",    'hb_fed',               'pct',  "ORDINARY TAX",     9),
         ("Federal\nTax (ord)", 'f_tax_ord',            '$',    "ORDINARY TAX",     13),
         ("Hi OR\nBracket",     'hb_or',                'pct',  "ORDINARY TAX",     9),
@@ -934,11 +1144,11 @@ def write_annual_summary(wb, rows, p, actual_yr, fallback_used):
         ("Total\nTax",         'total_tax',            '$',    "TOTALS",           13),
         ("Ord Income\nEff Rate", 'eff1',                'pct',  "TOTALS",            9),
         ("All-In\nEff Rate",   'eff2',                 'pct',  "TOTALS",            9),
+        ("MAGI",               'magi',                 '$',    "TOTALS",           14),
         ("After-Tax\nCash",    'after_tax_cash',       '$',    "NET CASH",         14),
-        ("Insurance",          'ins',                  '$',    "NET CASH",         13),
-        ("Net\nSpendable",     'after_tax_net',        '$',    "NET CASH",         14),
         ("RMD\nRequired",      'rmd',                  '$',    "RMD",              12),
-        ("IRMAA\nSurcharge",   'irmaa',                '$',    "IRMAA",            12),
+        ("Insurance\n(incl IRMAA)", 'ins',             '$',    "INSURANCE",        14),
+        ("IRMAA\nSurcharge",   'irmaa',                '$',    "INSURANCE",        12),
         ("ACA\nHH Size",  'aca_hh_size',          'int',  "ACA",               8),
         ("ACA Subsidy\nCliff (400% FPL)", 'aca_cliff', '$',    "ACA",              16),
     ]
@@ -946,16 +1156,26 @@ def write_annual_summary(wb, rows, p, actual_yr, fallback_used):
     GROUP_COLORS = {
         "YEAR":BLUE_H, "YEAR-END BALANCES":TEAL_H, "WITHDRAWALS":GREEN_H,
         "ORDINARY TAX":RED_H, "DIVIDEND TAX":"880E4F", "TAXABLE LTCG TAX":"BF360C",
-        "TOTALS":"212121", "NET CASH":BROWN_H, "RMD":PURPLE_H, "IRMAA":GREY_H,
+        "TOTALS":"212121", "NET CASH":BROWN_H, "RMD":PURPLE_H, "INSURANCE":BROWN_H,
         "ACA":"00838F",
     }
 
     fallback_note = f" ⚠ Tax Law {p['tax_law_year']} not available — using {actual_yr}" if fallback_used else ""
+    if p.get('gogo_rate', 0) > 0:
+        gogo_yrs   = p.get('gogo_years',   0) or p['retire_years'] // 3
+        slowgo_yrs = p.get('slowgo_years', 0) or p['retire_years'] // 3
+        rate_str = (f"Go-Go {p['gogo_rate']*100:.0f}% (yrs 1–{gogo_yrs}) → "
+                    f"Slow-Go {p['slowgo_rate']*100:.0f}% (yrs {gogo_yrs+1}–{gogo_yrs+slowgo_yrs}) → "
+                    f"No-Go {p['nogo_rate']*100:.0f}% (yrs {gogo_yrs+slowgo_yrs+1}–{p['retire_years']})")
+    else:
+        rate_str = f"Gross Withdrawal Rate: {p.get('withdraw_rate', 0)*100:.0f}%"
+    last_end_port = rows[-1]['end_port']
     title = (f"RETIREMENT WITHDRAWAL PLANNER — ANNUAL SUMMARY"
-             f" | Gross Withdrawal Rate: {p['withdraw_rate']*100:.0f}%"
+             f" | {rate_str}"
              f" | Roth Conversion Bracket: {p['conv_bracket']*100:.0f}%"
              f" | Tax Law: {actual_yr}{fallback_note}"
-             f" | {p['retire_year']}–{p['retire_year']+p['retire_years']-1}")
+             f" | {p['retire_year']}–{p['retire_year']+p['retire_years']-1}"
+             f" | Ending Portfolio Balance: ${last_end_port:,.0f}")
     t = ws.cell(1, 1, title)
     t.font = Font(bold=True, size=12, color=BLUE_H if not fallback_used else RED_H)
     ws.merge_cells(f"A1:{get_column_letter(len(COLS))}1")
@@ -987,10 +1207,12 @@ def write_annual_summary(wb, rows, p, actual_yr, fallback_used):
             if fmt=='$':   c.number_format='#,##0'
             if fmt=='pct': c.number_format='0.0%'
             if fmt=='int': c.number_format='0'
-            if key=='hb_fed':
+            if key=='phase':
+                c.alignment=Alignment(horizontal='center',vertical='center')
+                c.font=Font(bold=True,size=8,color=WHITE)
+                c.fill=cfill("2E7D32") if val=='Go-Go' else cfill("E65100") if val=='Slow-Go' else cfill("B71C1C")
+            elif key=='hb_fed':
                 c.fill=cfill("FFF9C4") if val<=0.22 else cfill("FFE0B2") if val<=0.24 else cfill("FFCDD2")
-            elif key=='after_tax_net':
-                c.fill=cfill("E8F5E9"); c.font=Font(bold=True,size=9)
             elif key=='total_tax': c.fill=cfill("FFEBEE")
             elif key=='rmd' and val>0: c.fill=cfill("EDE7F6"); c.font=Font(bold=True,size=9)
             elif key=='irmaa':
@@ -1031,7 +1253,7 @@ def write_annual_summary(wb, rows, p, actual_yr, fallback_used):
     sum_keys={'trad_wd','taxable_principal_wd','roth_wd','div','roth_conv','ss1','ss2',
               'gross_target','f_tax_ord','or_tax_ord','div_fed','div_or','div_niit',
               'tx_fed','tx_or','tx_niit','fed_taxable_income','total_tax',
-              'after_tax_cash','ins','after_tax_net','rmd'}
+              'after_tax_cash','ins','rmd'}
     for ci,(_,key,_,_,_) in enumerate(COLS,1):
         if key in sum_keys:
             c=ws.cell(tr,ci,sum(r[key] for r in rows))
@@ -1079,7 +1301,7 @@ def write_insurance_detail(wb, rows, p):
     t=ws.cell(1,1,"HEALTH INSURANCE DETAIL — ACA Gold (pre-65) & Medicare (post-65)")
     t.font=Font(bold=True,size=12,color=TEAL_H); ws.merge_cells("A1:H1")
     hdrs=["Year","S1 Age","S2 Age","S1 Coverage","S1 Annual","S2 Coverage","S2 Annual",
-          "Children on ACA","Children Cost","Total Annual"]
+          "Children on ACA","Children Cost","Base Insurance","IRMAA Surcharge","Total Annual"]
     for ci,h in enumerate(hdrs,1):
         c=ws.cell(3,ci,h); c.fill=hfill(TEAL_H); c.font=Font(bold=True,color=WHITE,size=9)
         c.alignment=Alignment(horizontal='center',wrap_text=True)
@@ -1094,18 +1316,24 @@ def write_insurance_detail(wb, rows, p):
         kids = children_on_aca(yr, p)
         kids_cost = sum(aca_mo_base*aca_age_factor(max(a,21))*12 for a in kids)
         kids_desc = ", ".join(f"age {a}" for a in kids) if kids else "—"
-        data=[yr,s1_age,s2_age,s1_cov,s1_cost,s2_cov,s2_cost,kids_desc,kids_cost,s1_cost+s2_cost+kids_cost]
+        base_ins = s1_cost+s2_cost+kids_cost
+        # IRMAA: read from simulation rows dict if available
+        row_irmaa = next((r['irmaa'] for r in rows if r['year']==yr), 0.0)
+        data=[yr,s1_age,s2_age,s1_cov,s1_cost,s2_cov,s2_cost,kids_desc,kids_cost,
+              base_ins,row_irmaa,base_ins+row_irmaa]
         for ci,val in enumerate(data,1):
             c=ws.cell(ri,ci,val); c.alignment=Alignment(horizontal='center'); c.border=tborder()
             if isinstance(val,float): c.number_format='#,##0'
             if ci in(4,5) and s1_cov=="Medicare": c.fill=cfill("E8F5E9")
             if ci in(6,7) and s2_cov=="Medicare": c.fill=cfill("E8F5E9")
             if ci in(8,9) and kids: c.fill=cfill("FFF8E1")
-            if ri%2==0 and not(ci in(4,5) and s1_cov=="Medicare") \
-                       and not(ci in(6,7) and s2_cov=="Medicare") \
-                       and not(ci in(8,9) and kids):
+            if ci==11 and isinstance(val,float) and val>0:
+                c.fill=cfill("FFF3E0"); c.font=Font(bold=True,color="E65100",size=9)
+            elif ri%2==0 and not(ci in(4,5) and s1_cov=="Medicare") \
+                         and not(ci in(6,7) and s2_cov=="Medicare") \
+                         and not(ci in(8,9) and kids):
                 c.fill=cfill("F5F5F5")
-    for ci,w in enumerate([7,7,7,12,14,12,14,18,14,16],1):
+    for ci,w in enumerate([7,7,7,12,14,12,14,18,14,14,14,16],1):
         ws.column_dimensions[get_column_letter(ci)].width=w
 
 
@@ -1164,7 +1392,10 @@ def write_strategy_summary(wb, rows, p, actual_yr, fallback_used):
     r=3
 
     r=section(r,"WITHDRAWAL ORDER & STRATEGY",BLUE_H)
-    r=bullet(r,f"{p['withdraw_rate']*100:.0f}% gross withdrawal rate on total portfolio each year")
+    if p.get('gogo_rate', 0) > 0:
+        r=bullet(r,f"3-Phase withdrawal: Go-Go {p['gogo_rate']*100:.0f}% → Slow-Go {p['slowgo_rate']*100:.0f}% → No-Go {p['nogo_rate']*100:.0f}%")
+    else:
+        r=bullet(r,f"{p.get('withdraw_rate',0)*100:.0f}% gross withdrawal rate on total portfolio each year")
     r=bullet(r,"Step 1 — Tax-Deferred: up to the Roth Conversion bracket ceiling")
     r=bullet(r,"Step 2 — Taxable Brokerage: principal fills gap (Fed LTCG + OR 9.9% + NIIT)",True)
     r=bullet(r,"Step 3 — Roth IRA: last resort, tax-free")
@@ -1188,6 +1419,272 @@ def write_strategy_summary(wb, rows, p, actual_yr, fallback_used):
     r=bullet(r,"See Tax Tables tab for exact bracket values used in this run",True)
 
     ws.column_dimensions['A'].width=80
+
+
+def write_monte_carlo(wb, rows, p):
+    import random, math
+    if "Monte Carlo" in wb.sheetnames: del wb["Monte Carlo"]
+    ws = wb.create_sheet("Monte Carlo")
+    ws.sheet_view.showGridLines = False
+    ws.sheet_properties.tabColor = BROWN_H
+
+    N_SIM   = 2_000
+    MU      = 0.075   # log-normal mean annual return
+    SIGMA   = 0.12    # log-normal std dev
+    YEARS   = p['retire_years']
+    random.seed(42)
+
+    # Net portfolio withdrawal each year = gross draws (taxes paid FROM these, not in addition).
+    # Dividends are generated by the taxable account and taken as cash (reduce balance).
+    # SS is external income — does NOT come from the portfolio.
+    net_wds = [r['trad_wd'] + r['roth_wd'] + r['taxable_principal_wd'] + r['div'] for r in rows]
+
+    start_port = p['trad_bal'] + p['roth_bal'] + p['taxable_bal']
+
+    def run_one(returns):
+        bal = start_port
+        for i, ret in enumerate(returns):
+            bal = max(0, (bal - net_wds[i]) * (1 + ret))
+        return bal
+
+    # Generate all simulations
+    log_mu    = math.log(1 + MU) - 0.5 * SIGMA**2
+    all_paths = []
+    for _ in range(N_SIM):
+        rets = [math.exp(random.gauss(log_mu, SIGMA)) - 1 for _ in range(YEARS)]
+        all_paths.append(rets)
+
+    # Year-by-year portfolio balances for each sim
+    year_balances = []   # year_balances[yr_idx] = sorted list of balances across sims
+    for yr_idx in range(YEARS):
+        bals = []
+        for rets in all_paths:
+            bal = start_port
+            for i in range(yr_idx + 1):
+                bal = max(0, (bal - net_wds[i]) * (1 + rets[i]))
+            bals.append(bal)
+        year_balances.append(sorted(bals))
+
+    def percentile(sorted_vals, pct):
+        idx = int(len(sorted_vals) * pct / 100)
+        return sorted_vals[min(idx, len(sorted_vals)-1)]
+
+    # Bad-sequence scenario: -35% crash in year 3
+    bad_base = [MU] * YEARS
+    bad_base[2] = -0.35
+    bad_path_bals = []
+    bal = start_port
+    for i in range(YEARS):
+        bal = max(0, (bal - net_wds[i]) * (1 + bad_base[i]))
+        bad_path_bals.append(bal)
+
+    # Success rate: sims where final balance > 0
+    final_bals = [run_one(rets) for rets in all_paths]
+    success_rate = sum(1 for b in final_bals if b > 0) / N_SIM
+
+    # ── Sheet layout ──
+    t = ws.cell(1, 1, f"MONTE CARLO SIMULATION — {N_SIM:,} runs | μ={MU*100:.1f}% σ={SIGMA*100:.1f}% log-normal | "
+                      f"Portfolio Success Rate: {success_rate*100:.1f}%")
+    t.font = Font(bold=True, size=12, color=BROWN_H)
+    ws.merge_cells("A1:H1")
+
+    ws.cell(2, 1, f"Starting portfolio: ${start_port:,.0f} | "
+                  f"Bad-sequence scenario: −35% crash in year 3, then {MU*100:.1f}%/yr | "
+                  f"Withdrawals follow the deterministic spending path (inflation-adjusted).")
+    ws.cell(2, 1).font = Font(italic=True, size=9, color="555555")
+    ws.merge_cells("A2:H2")
+
+    hdrs = ["Year", "Age S1", "Det. Portfolio\n(Base Case)",
+            "P10\n(Worst 10%)", "P25", "P50\n(Median)", "P75", "P90\n(Best 10%)",
+            "Bad Sequence\n(−35% Yr 3)"]
+    for ci, h in enumerate(hdrs, 1):
+        c = ws.cell(4, ci, h)
+        c.fill = hfill(BROWN_H); c.font = Font(bold=True, color=WHITE, size=9)
+        c.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+        c.border = tborder()
+    ws.row_dimensions[4].height = 30
+
+    det_bals = []
+    bal = start_port
+    for i in range(YEARS):
+        bal = max(0, (bal - net_wds[i]) * (1 + p['growth_rate']))
+        det_bals.append(bal)
+
+    PCTS = [10, 25, 50, 75, 90]
+    for ri, i in enumerate(range(YEARS), 5):
+        yr     = p['retire_year'] + i
+        s1_age = p['spouse1_age'] + (yr - 2026)
+        yb     = year_balances[i]
+
+        row_vals = [yr, s1_age, det_bals[i]] + \
+                   [percentile(yb, pc) for pc in PCTS] + \
+                   [bad_path_bals[i]]
+
+        for ci, val in enumerate(row_vals, 1):
+            c = ws.cell(ri, ci, val)
+            c.border = tborder()
+            c.alignment = Alignment(horizontal='right' if ci > 2 else 'center', vertical='center')
+            if ci == 1: c.alignment = Alignment(horizontal='center')
+            if isinstance(val, float) and val > 10:
+                c.number_format = '#,##0'
+            # Colour: red if balance = 0 (portfolio depleted)
+            if ci > 2 and val == 0:
+                c.fill = cfill("FFCDD2"); c.font = Font(color="B71C1C", size=9)
+            elif ci == 6:   # P50 median — highlight
+                c.fill = cfill("E8F5E9"); c.font = Font(bold=True, size=9)
+            elif ci == 9:   # bad sequence
+                c.fill = cfill("FFF3E0")
+            elif ri % 2 == 0:
+                c.fill = cfill("FAFAFA")
+
+    # Summary row
+    sr = 5 + YEARS
+    ws.cell(sr, 1, "FINAL").fill = hfill(BROWN_H)
+    ws.cell(sr, 1).font = Font(bold=True, color=WHITE)
+    ws.cell(sr, 1).border = tborder()
+    ws.cell(sr, 2, f"Yr {YEARS}").border = tborder()
+    ws.cell(sr, 2).alignment = Alignment(horizontal='center')
+    summary_vals = [det_bals[-1]] + [percentile(year_balances[-1], pc) for pc in PCTS] + [bad_path_bals[-1]]
+    for ci, val in enumerate(summary_vals, 3):
+        c = ws.cell(sr, ci, val)
+        c.number_format = '#,##0'; c.border = tborder()
+        c.font = Font(bold=True, size=10)
+        c.alignment = Alignment(horizontal='right')
+        c.fill = cfill("FFCDD2") if val == 0 else cfill("C8E6C9")
+    ws.row_dimensions[sr].height = 20
+
+    # Success rate note
+    nr = sr + 2
+    note = ws.cell(nr, 1,
+        f"Portfolio Success Rate: {success_rate*100:.1f}% of {N_SIM:,} simulations end with balance > $0  |  "
+        f"P10=worst 10%, P50=median outcome, P90=best 10%  |  "
+        f"Bad-sequence: −35% crash year 3, then {MU*100:.1f}%/yr thereafter.")
+    note.font = Font(italic=True, size=9, color="444444")
+    note.alignment = Alignment(wrap_text=True)
+    ws.merge_cells(f"A{nr}:I{nr}")
+    ws.row_dimensions[nr].height = 24
+
+    col_widths = [7, 7, 16, 14, 12, 14, 12, 14, 16]
+    for ci, w in enumerate(col_widths, 1):
+        ws.column_dimensions[get_column_letter(ci)].width = w
+
+
+def write_roth_conversion_comparison(wb, p, tl, base_yr):
+    sheet_name = "Roth Conversion Scenario Comparison"
+    if sheet_name in wb.sheetnames: del wb[sheet_name]
+    ws = wb.create_sheet(sheet_name)
+    ws.sheet_view.showGridLines = False
+    ws.sheet_properties.tabColor = PURPLE_H
+
+    scenarios = [
+        ("No Conversion",  {**p, 'conv_bracket': 0}),
+        ("Convert to 22%", {**p, 'conv_bracket': 0.22}),
+        ("Convert to 24%", {**p, 'conv_bracket': 0.24}),
+    ]
+
+    # Run all 3 simulations
+    sim_results = [(label, run_simulation(sp, tl, base_yr)) for label, sp in scenarios]
+
+    t = ws.cell(1, 1, "ROTH CONVERSION SCENARIO COMPARISON — No Conversion vs 22% vs 24%")
+    t.font = Font(bold=True, size=13, color=PURPLE_H)
+    ws.merge_cells(f"A1:{get_column_letter(2 + len(scenarios)*2)}1")
+
+    # Header row
+    hdrs = ["Year", "Age S1/S2"] + [f"{lbl}\nNet Spendable" for lbl, _ in sim_results] \
+         + [f"{lbl}\nRoth Conv" for lbl, _ in sim_results]
+    for ci, h in enumerate(hdrs, 1):
+        c = ws.cell(3, ci, h)
+        c.fill = hfill(PURPLE_H); c.font = Font(bold=True, color=WHITE, size=9)
+        c.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+        c.border = tborder()
+    ws.row_dimensions[3].height = 30
+
+    n = len(sim_results)
+    for ri, i in enumerate(range(p['retire_years']), 4):
+        yr = p['retire_year'] + i
+        s1_age = p['spouse1_age'] + (yr - 2026)
+        s2_age = p['spouse2_age'] + (yr - 2026)
+
+        ws.cell(ri, 1, yr).border = tborder()
+        ws.cell(ri, 2, f"{s1_age}/{s2_age}").border = tborder()
+        ws.cell(ri, 2).alignment = Alignment(horizontal='center')
+
+        spendables = [rows[i]['after_tax_net'] for _, rows in sim_results]
+        convs      = [rows[i]['roth_conv']      for _, rows in sim_results]
+
+        best_idx  = spendables.index(max(spendables))
+        worst_idx = spendables.index(min(spendables))
+
+        for si, val in enumerate(spendables):
+            c = ws.cell(ri, 3 + si, val)
+            c.number_format = '#,##0'; c.border = tborder()
+            c.alignment = Alignment(horizontal='right', vertical='center')
+            if si == best_idx:
+                c.fill = cfill("C8E6C9"); c.font = Font(bold=True, color="1B5E20")
+            elif si == worst_idx:
+                c.fill = cfill("FFCDD2"); c.font = Font(bold=True, color="B71C1C")
+            elif ri % 2 == 0:
+                c.fill = cfill("F5F5F5")
+
+        for si, val in enumerate(convs):
+            c = ws.cell(ri, 3 + n + si, val)
+            c.number_format = '#,##0'; c.border = tborder()
+            c.alignment = Alignment(horizontal='right', vertical='center')
+            if val > 0:
+                c.fill = cfill("EDE7F6")
+            elif ri % 2 == 0:
+                c.fill = cfill("F5F5F5")
+
+    # Totals row
+    tr = 4 + p['retire_years']
+    ws.cell(tr, 1, "TOTAL").fill = hfill(PURPLE_H)
+    ws.cell(tr, 1).font = Font(bold=True, color=WHITE)
+    ws.cell(tr, 1).border = tborder()
+    ws.cell(tr, 2, "35-year sum").border = tborder()
+    ws.cell(tr, 2).font = Font(italic=True, size=9, color="666666")
+
+    total_spendables = [sum(rows[i]['after_tax_net'] for i in range(p['retire_years']))
+                        for _, rows in sim_results]
+    total_convs      = [sum(rows[i]['roth_conv']      for i in range(p['retire_years']))
+                        for _, rows in sim_results]
+
+    best_tot  = total_spendables.index(max(total_spendables))
+    worst_tot = total_spendables.index(min(total_spendables))
+
+    for si, val in enumerate(total_spendables):
+        c = ws.cell(tr, 3 + si, val)
+        c.number_format = '#,##0'; c.border = tborder()
+        c.font = Font(bold=True, size=11)
+        c.alignment = Alignment(horizontal='right', vertical='center')
+        if si == best_tot:
+            c.fill = cfill("A5D6A7"); c.font = Font(bold=True, size=11, color="1B5E20")
+        elif si == worst_tot:
+            c.fill = cfill("EF9A9A"); c.font = Font(bold=True, size=11, color="B71C1C")
+        else:
+            c.fill = cfill("EDE7F6")
+
+    for si, val in enumerate(total_convs):
+        c = ws.cell(tr, 3 + n + si, val)
+        c.number_format = '#,##0'; c.border = tborder()
+        c.font = Font(bold=True)
+        c.alignment = Alignment(horizontal='right', vertical='center')
+        c.fill = cfill("EDE7F6")
+
+    ws.row_dimensions[tr].height = 22
+
+    # Legend note
+    note_row = tr + 2
+    note = ws.cell(note_row, 1,
+        "Green = best total spendable   |   Red = worst total spendable   |"
+        "   Purple = Roth conversion amount   |   All 3 scenarios use identical inputs except conversion bracket.")
+    note.font = Font(italic=True, size=9, color="444444")
+    note.alignment = Alignment(wrap_text=True)
+    ws.merge_cells(f"A{note_row}:{get_column_letter(2 + n*2)}{note_row}")
+    ws.row_dimensions[note_row].height = 24
+
+    col_widths = [7, 10] + [16]*n + [14]*n
+    for ci, w in enumerate(col_widths, 1):
+        ws.column_dimensions[get_column_letter(ci)].width = w
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1222,7 +1719,10 @@ def main():
         print(f"  Tax law year: {actual_yr}")
 
     print(f"  Portfolio: Trad ${p['trad_bal']:,.0f} | Taxable ${p['taxable_bal']:,.0f} | Roth ${p['roth_bal']:,.0f}")
-    print(f"  Withdrawal: {p['withdraw_rate']*100:.0f}% | Conv Bracket: {p['conv_bracket']*100:.0f}% | {p['retire_year']}–{p['retire_year']+p['retire_years']-1}")
+    if p.get('gogo_rate', 0) > 0:
+        print(f"  Withdrawal: Go-Go {p['gogo_rate']*100:.0f}% / Slow-Go {p['slowgo_rate']*100:.0f}% / No-Go {p['nogo_rate']*100:.0f}% | Conv Bracket: {p['conv_bracket']*100:.0f}% | {p['retire_year']}–{p['retire_year']+p['retire_years']-1}")
+    else:
+        print(f"  Withdrawal: {p.get('withdraw_rate',0)*100:.0f}% | Conv Bracket: {p['conv_bracket']*100:.0f}% | {p['retire_year']}–{p['retire_year']+p['retire_years']-1}")
 
     print(f"\nRunning simulation...")
     rows = run_simulation(p, tl, actual_yr)
@@ -1230,9 +1730,26 @@ def main():
     print("Writing output sheets...")
     wb = openpyxl.load_workbook(filepath)
 
+    # Rebuild Inputs sheet with current values and correct row order
+    create_inputs_sheet(wb, values=p)
+
+    # Remove any sheets that are not Inputs and not in our current output set,
+    # so stale sheets from old script versions don't persist.
+    known_output_sheets = {
+        "Tax Tables", "Assumptions", "Annual Summary", "SS Scenarios",
+        "Roth Conversion Scenario Comparison", "Monte Carlo",
+        "Insurance Detail", "RMD Projections", "Strategy Summary",
+    }
+    for name in list(wb.sheetnames):
+        if name != "Inputs" and name not in known_output_sheets:
+            del wb[name]
+            print(f"  Removed stale sheet: {name}")
+
     write_assumptions_output(wb, rows, p, tl, actual_yr, actual_yr, fallback_used)
     write_annual_summary(wb, rows, p, actual_yr, fallback_used)
     write_ss_scenarios(wb, p)
+    write_roth_conversion_comparison(wb, p, tl, actual_yr)
+    write_monte_carlo(wb, rows, p)
     write_insurance_detail(wb, rows, p)
     write_rmd_projections(wb, rows, p, tl)
     write_strategy_summary(wb, rows, p, actual_yr, fallback_used)
@@ -1240,23 +1757,24 @@ def main():
 
     # Ensure tab order: Inputs first, Tax Tables second, then outputs
     sheet_order = ["Inputs", "Tax Tables", "Assumptions", "Annual Summary",
-                   "SS Scenarios", "Insurance Detail", "RMD Projections", "Strategy Summary"]
+                   "SS Scenarios", "Roth Conversion Scenario Comparison", "Monte Carlo",
+                   "Insurance Detail", "RMD Projections", "Strategy Summary"]
     for i, name in enumerate(sheet_order):
         if name in wb.sheetnames:
             wb.move_sheet(name, offset=i - wb.sheetnames.index(name))
 
     wb.save(filepath)
 
-    total_at = sum(r['after_tax_net'] for r in rows)
+    total_at = sum(r['after_tax_cash'] for r in rows)
     last = rows[-1]
     end_roth = last['roth_open']*(1+p['growth_rate'])
     end_trad = last['trad_open']*(1+p['growth_rate'])
     end_tax  = last['taxable_open']*(1+p['price_return'])
     print(f"\n── RESULTS ─────────────────────────────────────────────")
-    print(f"  Year 1 spendable:      ${rows[0]['after_tax_net']:>12,.0f}")
-    print(f"  Average spendable/yr:  ${total_at/p['retire_years']:>12,.0f}")
-    print(f"  Year {p['retire_years']} spendable:     ${last['after_tax_net']:>12,.0f}")
-    print(f"  Total spendable:       ${total_at:>12,.0f}")
+    print(f"  Year 1 after-tax cash:      ${rows[0]['after_tax_cash']:>12,.0f}")
+    print(f"  Average after-tax cash/yr:  ${sum(r['after_tax_cash'] for r in rows)/p['retire_years']:>12,.0f}")
+    print(f"  Year {p['retire_years']} after-tax cash:     ${last['after_tax_cash']:>12,.0f}")
+    print(f"  Total after-tax cash:       ${sum(r['after_tax_cash'] for r in rows):>12,.0f}")
     print(f"  Total taxes paid:      ${sum(r['total_tax'] for r in rows):>12,.0f}")
     print(f"  End portfolio:         ${end_trad+end_roth+end_tax:>12,.0f}  (Roth: ${end_roth:,.0f})")
     print(f"\n✓ Saved: {filepath}")
