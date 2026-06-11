@@ -31,6 +31,8 @@ import sys, os, datetime
 import openpyxl
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+from openpyxl.chart import LineChart, BarChart, Reference
+from openpyxl.chart.series import SeriesLabel
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TAX LAW DATABASE  — add a new year entry each time IRS/CMS publishes updates
@@ -1607,7 +1609,7 @@ def write_roth_conversion_comparison(wb, p, tl, base_yr):
     ws.merge_cells(f"A1:{get_column_letter(2 + len(scenarios)*2)}1")
 
     # Header row
-    hdrs = ["Year", "Age S1/S2"] + [f"{lbl}\nNet Spendable" for lbl, _ in sim_results] \
+    hdrs = ["Year", "Age S1/S2"] + [f"{lbl}\nNet After Tax" for lbl, _ in sim_results] \
          + [f"{lbl}\nRoth Conv" for lbl, _ in sim_results]
     for ci, h in enumerate(hdrs, 1):
         c = ws.cell(3, ci, h)
@@ -1626,7 +1628,7 @@ def write_roth_conversion_comparison(wb, p, tl, base_yr):
         ws.cell(ri, 2, f"{s1_age}/{s2_age}").border = tborder()
         ws.cell(ri, 2).alignment = Alignment(horizontal='center')
 
-        spendables = [rows[i]['after_tax_net'] for _, rows in sim_results]
+        spendables = [rows[i]['after_tax_cash'] for _, rows in sim_results]
         convs      = [rows[i]['roth_conv']      for _, rows in sim_results]
 
         best_idx  = spendables.index(max(spendables))
@@ -1660,7 +1662,7 @@ def write_roth_conversion_comparison(wb, p, tl, base_yr):
     ws.cell(tr, 2, "35-year sum").border = tborder()
     ws.cell(tr, 2).font = Font(italic=True, size=9, color="666666")
 
-    total_spendables = [sum(rows[i]['after_tax_net'] for i in range(p['retire_years']))
+    total_spendables = [sum(rows[i]['after_tax_cash'] for i in range(p['retire_years']))
                         for _, rows in sim_results]
     total_convs      = [sum(rows[i]['roth_conv']      for i in range(p['retire_years']))
                         for _, rows in sim_results]
@@ -1692,7 +1694,7 @@ def write_roth_conversion_comparison(wb, p, tl, base_yr):
     # Legend note
     note_row = tr + 2
     note = ws.cell(note_row, 1,
-        "Green = best total spendable   |   Red = worst total spendable   |"
+        "Green = best total net after tax   |   Red = worst total net after tax   |"
         "   Purple = Roth conversion amount   |   All 3 scenarios use identical inputs except conversion bracket.")
     note.font = Font(italic=True, size=9, color="444444")
     note.alignment = Alignment(wrap_text=True)
@@ -1702,6 +1704,96 @@ def write_roth_conversion_comparison(wb, p, tl, base_yr):
     col_widths = [7, 10] + [16]*n + [14]*n
     for ci, w in enumerate(col_widths, 1):
         ws.column_dimensions[get_column_letter(ci)].width = w
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CHARTS SHEET
+# ═══════════════════════════════════════════════════════════════════════════════
+def write_charts(wb, rows, p):
+    if "Charts" in wb.sheetnames: del wb["Charts"]
+    ws = wb.create_sheet("Charts")
+    ws.sheet_view.showGridLines = False
+    ws.sheet_properties.tabColor = "1565C0"
+
+    # ── Title ──
+    t = ws.cell(1, 1, "RETIREMENT PROJECTIONS — KEY CHARTS")
+    t.font = Font(bold=True, size=14, color=BLUE_H)
+    ws.merge_cells("A1:H1")
+
+    # ── Data table (cols A–E, rows 3+) ──
+    hdrs = ["Year", "Ending Portfolio Balance", "Portfolio Withdrawal", "Social Security Income", "Total Tax", "Net After-Tax Cash"]
+    for ci, h in enumerate(hdrs, 1):
+        c = ws.cell(3, ci, h)
+        c.font = Font(bold=True, size=9, color=WHITE)
+        c.fill = hfill(BLUE_H)
+        c.alignment = Alignment(horizontal='center')
+        c.border = tborder()
+
+    for ri, row in enumerate(rows, 4):
+        ws.cell(ri, 1, row['year']).border = tborder()
+        ws.cell(ri, 2, row['end_port']).border = tborder()
+        ws.cell(ri, 3, row['gross_target']).border = tborder()
+        ws.cell(ri, 4, row['ss_total']).border = tborder()
+        ws.cell(ri, 5, row['total_tax']).border = tborder()
+        ws.cell(ri, 6, row['after_tax_cash']).border = tborder()
+        for ci in range(1, 7):
+            ws.cell(ri, ci).number_format = '#,##0'
+            ws.cell(ri, ci).alignment = Alignment(horizontal='right')
+
+    n = len(rows)
+    data_start = 4
+    data_end   = data_start + n - 1
+
+    ws.column_dimensions['A'].width = 8
+    ws.column_dimensions['B'].width = 24
+    ws.column_dimensions['C'].width = 22
+    ws.column_dimensions['D'].width = 22
+    ws.column_dimensions['E'].width = 14
+    ws.column_dimensions['F'].width = 20
+
+    cats_ref = Reference(ws, min_col=1, min_row=data_start, max_row=data_end)
+
+    # ── Chart: Stacked Bar + Net After-Tax line overlay ──
+    bar_chart = BarChart()
+    bar_chart.type          = "col"
+    bar_chart.grouping      = "stacked"
+    bar_chart.title         = "Annual Income, Tax & Net After-Tax Cash"
+    bar_chart.style         = 10
+    bar_chart.y_axis.title  = "Amount ($)"
+    bar_chart.x_axis.title  = "Year"
+    bar_chart.y_axis.numFmt = '#,##0'
+    bar_chart.width         = 22
+    bar_chart.height        = 14
+
+    bar_series_defs = [
+        (3, "Portfolio Withdrawal", "1565C0"),
+        (4, "Social Security",      "2E7D32"),
+        (5, "Total Tax",            "B71C1C"),
+    ]
+    for col, label, color in bar_series_defs:
+        ref = Reference(ws, min_col=col, min_row=data_start, max_row=data_end)
+        bar_chart.add_data(ref)
+        s = bar_chart.series[-1]
+        s.title = SeriesLabel(v=label)
+        s.graphicalProperties.solidFill = color
+        s.graphicalProperties.line.solidFill = color
+
+    bar_chart.set_categories(cats_ref)
+
+    # Line series for Net After-Tax Cash — plotted on secondary y-axis
+    line_overlay = LineChart()
+    net_ref = Reference(ws, min_col=6, min_row=data_start, max_row=data_end)
+    line_overlay.add_data(net_ref)
+    line_overlay.set_categories(cats_ref)
+    line_overlay.series[0].title  = SeriesLabel(v="Net After-Tax Cash")
+    line_overlay.series[0].graphicalProperties.line.solidFill = "FF8F00"
+    line_overlay.series[0].graphicalProperties.line.width     = 25000
+    line_overlay.series[0].smooth = True
+    line_overlay.y_axis.axId = 200
+    line_overlay.y_axis.crosses = "max"      # secondary axis on right side
+
+    bar_chart += line_overlay
+    ws.add_chart(bar_chart, "H3")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1753,7 +1845,7 @@ def main():
     # Remove any sheets that are not Inputs and not in our current output set,
     # so stale sheets from old script versions don't persist.
     known_output_sheets = {
-        "Tax Tables", "Assumptions", "Annual Summary", "SS Scenarios",
+        "Tax Tables", "Assumptions", "Annual Summary", "Charts", "SS Scenarios",
         "Roth Conversion Scenario Comparison", "Monte Carlo",
         "Insurance Detail", "RMD Projections", "Strategy Summary",
     }
@@ -1764,6 +1856,7 @@ def main():
 
     write_assumptions_output(wb, rows, p, tl, actual_yr, actual_yr, fallback_used)
     write_annual_summary(wb, rows, p, actual_yr, fallback_used)
+    write_charts(wb, rows, p)
     write_ss_scenarios(wb, p)
     write_roth_conversion_comparison(wb, p, tl, actual_yr)
     write_monte_carlo(wb, rows, p)
@@ -1775,7 +1868,7 @@ def main():
     # Ensure tab order: Inputs first, Tax Tables second, then outputs
     sheet_order = ["Inputs", "Tax Tables", "Assumptions", "Annual Summary",
                    "SS Scenarios", "Roth Conversion Scenario Comparison", "Monte Carlo",
-                   "Insurance Detail", "RMD Projections", "Strategy Summary"]
+                   "Insurance Detail", "RMD Projections", "Strategy Summary", "Charts"]
     for i, name in enumerate(sheet_order):
         if name in wb.sheetnames:
             wb.move_sheet(name, offset=i - wb.sheetnames.index(name))
